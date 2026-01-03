@@ -45,7 +45,8 @@ app.post("/list", async (req, res) => {
         }`,
       }),
     });
-    res.json(data.data.Get[req.body.class] ?? []);
+    if (data?.errors?.length) console.error('weaviate graphql /list errors', data.errors);
+    res.json(data?.data?.Get?.[req.body.class] ?? []);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -80,6 +81,44 @@ app.post("/delete", async (req, res) => {
   }
 });
 
+app.post('/object', async (req, res) => {
+  const { base, apiKey, id } = req.body;
+  if (!base) return res.status(400).json({ error: 'Missing base URL' });
+  if (!id) return res.status(400).json({ error: 'Missing object id' });
+
+  try {
+    const doFetch = async (path) => {
+      const resp = await fetch(`${base}${path}`, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        }
+      });
+      const text = await resp.text();
+      if (!resp.ok) {
+        const msg = text?.trim() ? text.trim() : `${resp.status} ${resp.statusText}`;
+        throw new Error(msg);
+      }
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        throw new Error(text?.trim() ? text.trim() : 'Invalid JSON response');
+      }
+    };
+
+    let obj;
+    try {
+      obj = await doFetch(`/v1/objects/${encodeURIComponent(id)}?include=vector`);
+    } catch (e) {
+      obj = await doFetch(`/v1/objects/${encodeURIComponent(id)}`);
+    }
+
+    res.json(obj);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/search", async (req, res) => {
   const gql =
     req.body.type === "hybrid"
@@ -95,7 +134,7 @@ app.post("/search", async (req, res) => {
             ) {
               query
               content
-              _additional { score }
+              _additional { id score }
             }
           }
         }`
@@ -106,7 +145,7 @@ app.post("/search", async (req, res) => {
               limit: 5
             ) {
               content
-              _additional { certainty }
+              _additional { id certainty }
             }
           }
         }`;
@@ -115,7 +154,8 @@ app.post("/search", async (req, res) => {
       method: "POST",
       body: JSON.stringify({ query: gql }),
     });
-    res.json(data.data.Get[req.body.class] ?? []);
+    if (data?.errors?.length) console.error('weaviate graphql /search errors', data.errors);
+    res.json(data?.data?.Get?.[req.body.class] ?? []);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -162,6 +202,24 @@ app.post('/info', async (req, res) => {
   const { base, apiKey } = req.body;
   if (!base) return res.status(400).json({ error: 'Missing base URL' });
 
+  async function aggregateCountForClass(className) {
+    const gql = `{
+      Aggregate {
+        ${className} {
+          meta { count }
+        }
+      }
+    }`;
+
+    const data = await weaviateFetch(base, '/v1/graphql', apiKey, {
+      method: 'POST',
+      body: JSON.stringify({ query: gql }),
+    });
+
+    const count = data?.data?.Aggregate?.[className]?.[0]?.meta?.count;
+    return typeof count === 'number' ? count : null;
+  }
+
   try {
     const meta = await weaviateFetch(base, '/v1/meta', apiKey);
     const schema = await weaviateFetch(base, '/v1/schema', apiKey);
@@ -170,30 +228,27 @@ app.post('/info', async (req, res) => {
     const classDetails = {};
     let total = 0;
 
-    for (const c of classes) {
+    await Promise.all(classes.map(async (c) => {
       const className = c.class || c.name || c;
       const details = {
         name: className,
         vectorizer: c.vectorizer || null,
-        vectorIndexConfig: c.vectorIndexConfig || null,
         vectorIndexType: c.vectorIndexType || null,
-        properties: Array.isArray(c.properties) ? c.properties.map(p => p.name) : undefined,
+        properties: Array.isArray(c.properties) ? c.properties.map((p) => p.name) : undefined,
         count: null,
       };
 
       try {
-        const resp = await weaviateFetch(base, `/v1/objects?class=${encodeURIComponent(className)}&limit=1`, apiKey);
-        const count = resp.totalResults ?? resp.total ?? (Array.isArray(resp.objects) ? resp.objects.length : null);
-        details.count = (typeof count === 'number') ? count : null;
+        details.count = await aggregateCountForClass(className);
         if (typeof details.count === 'number') total += details.count;
       } catch (e) {
         console.error('count error for', className, e.message);
       }
 
       classDetails[className] = details;
-    }
+    }));
 
-    res.json({ meta, classes: classes.map(c => c.class || c.name), classDetails, total });
+    res.json({ meta, classes: classes.map((c) => c.class || c.name), classDetails, total });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -317,6 +372,22 @@ button:disabled { opacity: .5 }
   gap: 10px;
 }
 
+.json {
+  background: #0f1328;
+  border: 1px solid #2a2f55;
+  border-radius: 10px;
+  padding: 10px;
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.card.selected {
+  outline: 1px solid var(--accent);
+}
+
 .small { font-size: 12px; color: var(--muted) }
 
 .results > div {
@@ -374,6 +445,12 @@ button:disabled { opacity: .5 }
 
       <hr style="opacity:.2">
 
+      <h3>Selected Object</h3>
+      <div id="selectedMeta" class="small">Click an item to view what Weaviate is storing.</div>
+      <pre id="selectedJson" class="json"></pre>
+
+      <hr style="opacity:.2">
+
       <h3>Add Entry</h3>
       <input id="addQuery" placeholder="Query">
       <textarea id="addContent" rows="3" placeholder="Content"></textarea>
@@ -384,22 +461,22 @@ button:disabled { opacity: .5 }
 
   <!-- SIDEBAR -->
   <div class="panel sidebar">
-  	<div>
-		<h2>Server</h2>
-		<input id="baseUrl" placeholder="http://localhost:8080">
-		<input id="apiKey" placeholder="API Key">
-    </div>
+  <div>
+    <h2>Server</h2>
+    <input id="baseUrl" placeholder="http://localhost:8080">
+    <input id="apiKey" placeholder="API Key">
+  </div>
 
-    <div>
-      <h2>Info</h2>
-      <div id="info" class="small">-</div>
-      </div>
+  <div>
+    <h2>Info</h2>
+    <div id="stats" class="small">-</div>
+    <div id="info" class="small">-</div>
+  </div>
 
   <div>
     <h2>Object Class</h2>
-    <select id="objectClass">
-    </select>
-    </div>
+    <select id="objectClass"></select>
+  </div>
   </div>
 
 </div>
@@ -410,21 +487,28 @@ const objectClasses = document.getElementById("objectClass");
 const apiKeyInput = document.getElementById("apiKey");
 //const searchType = document.getElementById("searchType");
 const hybridAlpha = document.getElementById('hybridAlpha');
+const statsDiv = document.getElementById('stats');
+const selectedMeta = document.getElementById('selectedMeta');
+const selectedJson = document.getElementById('selectedJson');
+let selectedId = null;
 
 baseInput.value = "${defaultBaseUrl}" || localStorage.getItem('weaviateBase') || '';
 apiKeyInput.value = localStorage.getItem('weaviateApiKey') || '';
 
 baseInput.addEventListener('change', async () => {
   localStorage.setItem('weaviateBase', baseInput.value);
+  await refreshInfo();
   await refreshClasses();
 });
 
 objectClasses.addEventListener('change', async () => {
   await refreshList();
+  await refreshInfo();
 });
 
 apiKeyInput.addEventListener('change', async () => {
   localStorage.setItem('weaviateApiKey', apiKeyInput.value);
+  await refreshInfo();
   await refreshClasses();
 });
 
@@ -446,6 +530,8 @@ async function refreshList() {
   items.forEach(i => {
     const card = document.createElement('div');
     card.className = 'card';
+    card.style.cursor = 'pointer';
+    card.onclick = () => selectObject(i._additional?.id);
 
     const left = document.createElement('div');
 
@@ -463,11 +549,62 @@ async function refreshList() {
 
     const del = document.createElement('button');
     del.textContent = '✕';
-    del.onclick = () => delItem(i._additional.id);
+    del.onclick = (e) => {
+      e.stopPropagation();
+      delItem(i._additional.id);
+    };
 
     card.append(left, del);
     list.appendChild(card);
   });
+
+  highlightSelected();
+}
+
+function highlightSelected() {
+  const list = document.getElementById('list');
+  if (!list) return;
+  const cards = list.querySelectorAll('.card');
+  cards.forEach((c) => c.classList.remove('selected'));
+  if (!selectedId) return;
+
+  for (const card of cards) {
+    const idEl = card.querySelector('.small');
+    if (idEl && idEl.textContent === selectedId) {
+      card.classList.add('selected');
+      break;
+    }
+  }
+}
+
+async function selectObject(id) {
+  if (!id) return;
+  selectedId = id;
+  highlightSelected();
+
+  if (selectedMeta) selectedMeta.textContent = 'Loading ' + id + '…';
+  if (selectedJson) selectedJson.textContent = '';
+
+  try {
+    const res = await fetch('/object', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base: base(), apiKey: apiKeyInput.value, id })
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => String(res.status));
+      if (selectedMeta) selectedMeta.textContent = 'Error loading object: ' + txt;
+      return;
+    }
+
+    const obj = await res.json();
+    const cls = obj?.class || '-';
+    if (selectedMeta) selectedMeta.textContent = 'id: ' + id + ' — class: ' + cls;
+    if (selectedJson) selectedJson.textContent = JSON.stringify(obj, null, 2);
+  } catch (e) {
+    if (selectedMeta) selectedMeta.textContent = 'Error loading object: ' + (e?.message || String(e));
+  }
 }
 
 async function refreshClasses() {
@@ -499,7 +636,11 @@ async function refreshClasses() {
 }
 
 async function refreshInfo() {
-  if (!base()) return;
+  if (!base()) {
+    if (statsDiv) statsDiv.innerHTML = '<span class="bold">Objects:</span> - (set Base URL)';
+    infoDiv.innerHTML = '-';
+    return;
+  }
   const res = await fetch('/info', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -509,24 +650,39 @@ async function refreshInfo() {
   if (!res.ok) {
     const txt = await res.text().catch(() => String(res.status));
     infoDiv.innerHTML = '<div class="small">Error fetching info: ' + txt + '</div>';
+    if (statsDiv) statsDiv.innerHTML = '<span class="bold">Objects:</span> - (error)';
     console.error('info fetch error', txt);
     return;
   }
 
   const data = await res.json();
   const total = data.total ?? 'unknown';
-  let html = '<div class="small">Total objects: ' + total + '</div>';
+  const selectedClass = objectClasses.value;
+  const selectedCount = (data.classDetails && selectedClass && data.classDetails[selectedClass])
+    ? data.classDetails[selectedClass].count
+    : null;
+
+  if (statsDiv) {
+    const classPart = selectedClass
+      ? ' — ' + selectedClass + ': ' + (typeof selectedCount === 'number' ? selectedCount : 'unknown')
+      : '';
+    statsDiv.innerHTML = '<span class="bold">Objects:</span> ' + total + classPart;
+  }
+  let html = '<div class="small"><span class="bold">Total objects:</span> ' + total + '</div>';
 
   if (data.classDetails && Object.keys(data.classDetails).length) {
-    html += '<div class="small" style="margin-top:8px">Per-class:</div>';
-    for (const [k, v] of Object.entries(data.classDetails)) {
-      const count = v.count === null ? 'unknown' : v.count;
-      const vec = v.vectorizer || v.vectorIndexType || '-';
-      const props = Array.isArray(v.properties) ? v.properties.join(', ') : '-';
-      let cfg = '-';
-      try { cfg = v.vectorIndexConfig ? JSON.stringify(v.vectorIndexConfig) : '-'; } catch(e) { cfg = '-'; }
-      html += '<div class="small">' + k + ': ' + count + ' — vec: ' + vec + ' — props: ' + props + '</div>';
-      html += '<div class="small">index config: ' + cfg + '</div>';
+    html += '<div class="small" style="margin-top:8px"><span class="bold">Per-class objects:</span></div>';
+    const entries = Object.entries(data.classDetails)
+      .map(([k, v]) => [k, v?.count])
+      .sort((a, b) => {
+        const av = typeof a[1] === 'number' ? a[1] : -1;
+        const bv = typeof b[1] === 'number' ? b[1] : -1;
+        return bv - av;
+      });
+
+    for (const [k, countVal] of entries) {
+      const count = typeof countVal === 'number' ? countVal : 'unknown';
+      html += '<div class="small">' + k + ': ' + count + '</div>';
     }
   }
 
@@ -595,6 +751,10 @@ async function runSearch() {
 	const result = document.createElement('div');
 	result.className = 'col';
 	result.style.gap = 'none';
+  if (i?._additional?.id) {
+    result.style.cursor = 'pointer';
+    result.onclick = () => selectObject(i._additional.id);
+  }
 
 	const queryRow = document.createElement('div');
 	const contentRow = document.createElement('div');
