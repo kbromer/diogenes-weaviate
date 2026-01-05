@@ -9,6 +9,8 @@ services:
       - --scheme
       - http
     image: cr.weaviate.io/semitechnologies/weaviate:1.34.0
+    mem_limit: 2g
+    mem_reservation: 1.5g    
     ports:
       - 8080:8080
     volumes:
