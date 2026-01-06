@@ -78,6 +78,16 @@ function asyncHandler(fn) {
 }
 
 /**
+ * Escape a string for safe use in GraphQL queries
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string
+ */
+function escapeGraphQL(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+}
+
+/**
  * Build GraphQL query for listing objects
  * @param {string} className - Weaviate class name
  * @param {number} limit - Maximum number of results
@@ -108,6 +118,7 @@ function buildListQuery(className, limit = DEFAULT_LIST_LIMIT) {
  */
 function buildSearchQuery(className, query, type = 'hybrid', options = {}) {
   const limit = options.limit || DEFAULT_SEARCH_LIMIT;
+  const escapedQuery = escapeGraphQL(query);
   
   if (type === 'hybrid') {
     const alpha = options.alpha || 0.5;
@@ -116,7 +127,7 @@ function buildSearchQuery(className, query, type = 'hybrid', options = {}) {
       Get {
         ${className}(
           hybrid: {
-            query: "${query}"
+            query: "${escapedQuery}"
             properties: ${JSON.stringify(properties)}
             alpha: ${alpha}
           }
@@ -133,7 +144,7 @@ function buildSearchQuery(className, query, type = 'hybrid', options = {}) {
     return `{
       Get {
         ${className}(
-          nearText: { concepts: ["${query}"], certainty: ${certainty} }
+          nearText: { concepts: ["${escapedQuery}"], certainty: ${certainty} }
           limit: ${limit}
         ) {
           content
@@ -207,8 +218,8 @@ app.post("/add", asyncHandler(async (req, res) => {
     body: JSON.stringify({
       class: className,
       properties: {
-        query: query,
-        content: content,
+        query,
+        content,
       },
     }),
   });
