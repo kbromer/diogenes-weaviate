@@ -9,8 +9,25 @@ app.use(express.urlencoded({ extended: true }));
 
 const defaultBaseUrl = process.argv[2] || '';
 
+/* ---------- Constants ---------- */
+
+const DEFAULT_LIST_LIMIT = 20;
+const DEFAULT_SEARCH_LIMIT = 5;
+const DEFAULT_NEARTEXT_CERTAINTY = 0.5;
+const DEFAULT_SEARCH_PROPERTIES = ["query", "content"];
+
+/**
+ * Helper function to make authenticated requests to Weaviate API
+ * @param {string} base - Base URL of Weaviate instance
+ * @param {string} path - API path (e.g., '/v1/graphql')
+ * @param {string} apiKey - API key for authentication
+ * @param {object} options - Additional fetch options
+ * @returns {Promise<object>} Parsed JSON response
+ * @throws {Error} If request fails or response is not valid JSON
+ */
 async function weaviateFetch(base, path, apiKey, options = {}) {
-  const res = await fetch(`${base}${path}`, {
+  const url = `${base}${path}`;
+  const res = await fetch(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -18,241 +35,298 @@ async function weaviateFetch(base, path, apiKey, options = {}) {
       ...(options.headers || {}),
     },
   });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
+  
+  const text = await res.text();
+  
+  if (!res.ok) {
+    const msg = text?.trim() ? text.trim() : `${res.status} ${res.statusText}`;
+    throw new Error(`Request to ${path} failed: ${msg}`);
+  }
+  
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Invalid JSON response from ${path}: ${text?.trim() || 'empty response'}`);
+  }
+}
+
+/**
+ * Helper function to check and log GraphQL errors
+ * @param {object} data - GraphQL response data
+ * @param {string} endpoint - Endpoint name for logging
+ * @returns {boolean} True if errors exist, false otherwise
+ */
+function checkGraphQLErrors(data, endpoint) {
+  if (data?.errors?.length) {
+    console.error(`weaviate graphql ${endpoint} errors`, data.errors);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Async error handler wrapper to reduce try-catch duplication
+ * @param {function} fn - Async route handler function
+ * @returns {function} Wrapped handler with error handling
+ */
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(e => {
+      res.status(500).json({ error: e.message });
+    });
+  };
+}
+
+/**
+ * Escape a string for safe use in GraphQL queries
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string
+ */
+function escapeGraphQL(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+}
+
+/**
+ * Build GraphQL query for listing objects
+ * @param {string} className - Weaviate class name
+ * @param {number} limit - Maximum number of results
+ * @returns {string} GraphQL query string
+ */
+function buildListQuery(className, limit = DEFAULT_LIST_LIMIT) {
+  return `{
+    Get {
+      ${className}(
+        limit: ${limit}
+        sort: [{ path: ["_creationTimeUnix"], order: desc }]
+      ) {
+        query
+        content
+        _additional { id }
+      }
+    }
+  }`;
+}
+
+/**
+ * Build GraphQL query for search (hybrid or nearText)
+ * @param {string} className - Weaviate class name
+ * @param {string} query - Search query
+ * @param {string} type - Search type ('hybrid' or 'nearText')
+ * @param {object} options - Additional search options
+ * @returns {string} GraphQL query string
+ */
+function buildSearchQuery(className, query, type = 'hybrid', options = {}) {
+  const limit = options.limit || DEFAULT_SEARCH_LIMIT;
+  const escapedQuery = escapeGraphQL(query);
+  
+  if (type === 'hybrid') {
+    const alpha = options.alpha || 0.5;
+    const properties = options.properties || DEFAULT_SEARCH_PROPERTIES;
+    return `{
+      Get {
+        ${className}(
+          hybrid: {
+            query: "${escapedQuery}"
+            properties: ${JSON.stringify(properties)}
+            alpha: ${alpha}
+          }
+          limit: ${limit}
+        ) {
+          query
+          content
+          _additional { id score }
+        }
+      }
+    }`;
+  } else {
+    const certainty = options.certainty || DEFAULT_NEARTEXT_CERTAINTY;
+    return `{
+      Get {
+        ${className}(
+          nearText: { concepts: ["${escapedQuery}"], certainty: ${certainty} }
+          limit: ${limit}
+        ) {
+          content
+          _additional { id certainty }
+        }
+      }
+    }`;
+  }
+}
+
+/**
+ * Build GraphQL query for getting schema classes
+ * @returns {string} GraphQL query string
+ */
+function buildClassesQuery() {
+  return `{
+    __schema {
+      types {
+        name
+        fields {
+          name
+        }
+      }
+    }
+  }`;
+}
+
+/**
+ * Build GraphQL query for aggregate count
+ * @param {string} className - Weaviate class name
+ * @returns {string} GraphQL query string
+ */
+function buildAggregateQuery(className) {
+  return `{
+    Aggregate {
+      ${className} {
+        meta { count }
+      }
+    }
+  }`;
 }
 
 /* ---------- Routes ---------- */
 
 app.get("/", (_, res) => res.send(renderPage()));
 
-app.post("/list", async (req, res) => {
-  try {
-    const data = await weaviateFetch(req.body.base, "/v1/graphql", req.body.apiKey, {
-      method: "POST",
-      body: JSON.stringify({
-        query: `{
-          Get {
-            ${req.body.class}(
-              limit: 20
-              sort: [{ path: ["_creationTimeUnix"], order: desc }]
-            ) {
-              query
-              content
-              _additional { id }
-            }
-          }
-        }`,
-      }),
-    });
-    if (data?.errors?.length) console.error('weaviate graphql /list errors', data.errors);
-    res.json(data?.data?.Get?.[req.body.class] ?? []);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+app.post("/list", asyncHandler(async (req, res) => {
+  const { base, class: className, apiKey } = req.body;
+  if (!base) return res.status(400).json({ error: 'Missing base URL' });
+  if (!className) return res.status(400).json({ error: 'Missing class name' });
+  
+  const data = await weaviateFetch(base, "/v1/graphql", apiKey, {
+    method: "POST",
+    body: JSON.stringify({
+      query: buildListQuery(className),
+    }),
+  });
+  checkGraphQLErrors(data, '/list');
+  res.json(data?.data?.Get?.[className] ?? []);
+}));
 
-app.post("/add", async (req, res) => {
-  try {
-    await weaviateFetch(req.body.base, "/v1/objects", req.body.apiKey, {
-      method: "POST",
-      body: JSON.stringify({
-        class: req.body.class,
-        properties: {
-          query: req.body.query,
-          content: req.body.content,
-        },
-      }),
-    });
-    res.sendStatus(200);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+app.post("/add", asyncHandler(async (req, res) => {
+  const { base, class: className, query, content, apiKey } = req.body;
+  if (!base) return res.status(400).json({ error: 'Missing base URL' });
+  if (!className) return res.status(400).json({ error: 'Missing class name' });
+  if (!query) return res.status(400).json({ error: 'Missing query' });
+  if (!content) return res.status(400).json({ error: 'Missing content' });
+  
+  await weaviateFetch(base, "/v1/objects", apiKey, {
+    method: "POST",
+    body: JSON.stringify({
+      class: className,
+      properties: {
+        query,
+        content,
+      },
+    }),
+  });
+  res.sendStatus(200);
+}));
 
-app.post("/delete", async (req, res) => {
-  try {
-    await weaviateFetch(req.body.base, `/v1/objects/${req.body.id}`, req.body.apiKey, {
-      method: "DELETE",
-    });
-    res.sendStatus(200);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+app.post("/delete", asyncHandler(async (req, res) => {
+  const { base, id, apiKey } = req.body;
+  if (!base) return res.status(400).json({ error: 'Missing base URL' });
+  if (!id) return res.status(400).json({ error: 'Missing object id' });
+  
+  await weaviateFetch(base, `/v1/objects/${id}`, apiKey, {
+    method: "DELETE",
+  });
+  res.sendStatus(200);
+}));
 
-app.post('/object', async (req, res) => {
+app.post('/object', asyncHandler(async (req, res) => {
   const { base, apiKey, id } = req.body;
   if (!base) return res.status(400).json({ error: 'Missing base URL' });
   if (!id) return res.status(400).json({ error: 'Missing object id' });
 
+  let obj;
   try {
-    const doFetch = async (path) => {
-      const resp = await fetch(`${base}${path}`, {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        }
-      });
-      const text = await resp.text();
-      if (!resp.ok) {
-        const msg = text?.trim() ? text.trim() : `${resp.status} ${resp.statusText}`;
-        throw new Error(msg);
-      }
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        throw new Error(text?.trim() ? text.trim() : 'Invalid JSON response');
-      }
-    };
-
-    let obj;
-    try {
-      obj = await doFetch(`/v1/objects/${encodeURIComponent(id)}?include=vector`);
-    } catch (e) {
-      obj = await doFetch(`/v1/objects/${encodeURIComponent(id)}`);
-    }
-
-    res.json(obj);
+    obj = await weaviateFetch(base, `/v1/objects/${encodeURIComponent(id)}?include=vector`, apiKey);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    obj = await weaviateFetch(base, `/v1/objects/${encodeURIComponent(id)}`, apiKey);
   }
-});
 
-app.post("/search", async (req, res) => {
-  const gql =
-    req.body.type === "hybrid"
-      ? `{
-          Get {
-            ${req.body.class}(
-              hybrid: {
-                query: "${req.body.query}"
-                properties: ["query","content"]
-                alpha: ${req.body.alpha}
-              }
-              limit: 5
-            ) {
-              query
-              content
-              _additional { id score }
-            }
-          }
-        }`
-      : `{
-          Get {
-            ${req.body.class}(
-              nearText: { concepts: ["${req.body.query}"], certainty: 0.5 }
-              limit: 5
-            ) {
-              content
-              _additional { id certainty }
-            }
-          }
-        }`;
-  try {
-    const data = await weaviateFetch(req.body.base, "/v1/graphql", req.body.apiKey, {
-      method: "POST",
-      body: JSON.stringify({ query: gql }),
-    });
-    if (data?.errors?.length) console.error('weaviate graphql /search errors', data.errors);
-    res.json(data?.data?.Get?.[req.body.class] ?? []);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+  res.json(obj);
+}));
 
-app.post("/classes", async (req, res) => {
-  const { base } = req.body;
+app.post("/search", asyncHandler(async (req, res) => {
+  const { base, class: className, query, type, alpha, apiKey } = req.body;
+  if (!base) return res.status(400).json({ error: 'Missing base URL' });
+  if (!className) return res.status(400).json({ error: 'Missing class name' });
+  if (!query) return res.status(400).json({ error: 'Missing query' });
+  
+  const gql = buildSearchQuery(className, query, type, { alpha });
+  
+  const data = await weaviateFetch(base, "/v1/graphql", apiKey, {
+    method: "POST",
+    body: JSON.stringify({ query: gql }),
+  });
+  checkGraphQLErrors(data, '/search');
+  res.json(data?.data?.Get?.[className] ?? []);
+}));
+
+app.post("/classes", asyncHandler(async (req, res) => {
+  const { base, apiKey } = req.body;
   if (!base) return res.status(400).json({ error: "Missing base URL" });
 
-  try {
-    const result = await fetch(`${base}/v1/graphql`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${req.body.apiKey}`,
-      },
-      body: JSON.stringify({
-        query: `
-          {
-            __schema {
-              types {
-                name
-                fields {
-                  name
-                }
-              }
-            }
-          }
-        `,
-      }),
-    });
+  const json = await weaviateFetch(base, "/v1/graphql", apiKey, {
+    method: "POST",
+    body: JSON.stringify({
+      query: buildClassesQuery(),
+    }),
+  });
+  checkGraphQLErrors(json, '/classes');
 
-    if (!result.ok) throw new Error(await result.text());
-    const json = await result.json();
+  const types = json.data.__schema.types.find((type) => type.name === "GetObjectsObj")?.fields;
+  res.json(types?.map((type) => type.name));
+}));
 
-	const types = json.data.__schema.types.find((type) => type.name === "GetObjectsObj")?.fields
-    res.json(types?.map((type) => type.name));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/info', async (req, res) => {
+app.post('/info', asyncHandler(async (req, res) => {
   const { base, apiKey } = req.body;
   if (!base) return res.status(400).json({ error: 'Missing base URL' });
 
   async function aggregateCountForClass(className) {
-    const gql = `{
-      Aggregate {
-        ${className} {
-          meta { count }
-        }
-      }
-    }`;
-
     const data = await weaviateFetch(base, '/v1/graphql', apiKey, {
       method: 'POST',
-      body: JSON.stringify({ query: gql }),
+      body: JSON.stringify({ query: buildAggregateQuery(className) }),
     });
 
     const count = data?.data?.Aggregate?.[className]?.[0]?.meta?.count;
     return typeof count === 'number' ? count : null;
   }
 
-  try {
-    const meta = await weaviateFetch(base, '/v1/meta', apiKey);
-    const schema = await weaviateFetch(base, '/v1/schema', apiKey);
+  const meta = await weaviateFetch(base, '/v1/meta', apiKey);
+  const schema = await weaviateFetch(base, '/v1/schema', apiKey);
 
-    const classes = schema?.classes || [];
-    const classDetails = {};
-    let total = 0;
+  const classes = schema?.classes || [];
+  const classDetails = {};
+  let total = 0;
 
-    await Promise.all(classes.map(async (c) => {
-      const className = c.class || c.name || c;
-      const details = {
-        name: className,
-        vectorizer: c.vectorizer || null,
-        vectorIndexType: c.vectorIndexType || null,
-        properties: Array.isArray(c.properties) ? c.properties.map((p) => p.name) : undefined,
-        count: null,
-      };
+  await Promise.all(classes.map(async (c) => {
+    const className = c.class || c.name || c;
+    const details = {
+      name: className,
+      vectorizer: c.vectorizer || null,
+      vectorIndexType: c.vectorIndexType || null,
+      properties: Array.isArray(c.properties) ? c.properties.map((p) => p.name) : undefined,
+      count: null,
+    };
 
-      try {
-        details.count = await aggregateCountForClass(className);
-        if (typeof details.count === 'number') total += details.count;
-      } catch (e) {
-        console.error('count error for', className, e.message);
-      }
+    try {
+      details.count = await aggregateCountForClass(className);
+      if (typeof details.count === 'number') total += details.count;
+    } catch (e) {
+      console.error('count error for', className, e.message);
+    }
 
-      classDetails[className] = details;
-    }));
+    classDetails[className] = details;
+  }));
 
-    res.json({ meta, classes: classes.map((c) => c.class || c.name), classDetails, total });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+  res.json({ meta, classes: classes.map((c) => c.class || c.name), classDetails, total });
+}));
 
 
 /* ---------- UI ---------- */
