@@ -36,7 +36,7 @@ This configuration includes:
 - **Weaviate 1.34.0** on port 8080
 - **text2vec-transformers** module with multilingual support
 - Persistent data storage
-- API key authentication (key: `homeassistant`)
+- API key authentication enabled (key: `homeassistant`) with anonymous access also allowed
 
 ### Option 2: Standalone with PM2 (Recommended for production)
 
@@ -175,7 +175,7 @@ Combines keyword (BM25) and vector similarity search:
 Semantic similarity using vector embeddings:
 - Certainty threshold: 0.5 by default (range: 0-1)
 - Higher certainty = stricter matching
-- Returns certainty scores
+- Returns `content` field and certainty scores (note: `query` field not included in results)
 
 ## Technology Stack
 
@@ -184,7 +184,7 @@ Semantic similarity using vector embeddings:
 - **Frontend**: Vanilla JavaScript with embedded CSS
 - **UI Framework**: Custom responsive design with CSS Grid
 - **API**: GraphQL and REST endpoints to Weaviate
-- **Containerization**: Docker with multi-stage build
+- **Containerization**: Docker with Alpine-based Node.js 20 image
 
 ## File Structure
 
